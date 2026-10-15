@@ -40,11 +40,13 @@ from __future__ import annotations
 
 import argparse
 import csv
+import itertools
 import json
+import os
 import sys
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from pathlib import Path
 
 try:
@@ -435,17 +437,23 @@ Rules:
 
 # ── LM Studio call ────────────────────────────────────────────────────────────
 
-def call_lm_studio(client: OpenAI, user_prompt: str, debug: bool = False) -> dict:
+def call_lm_studio(
+    client: OpenAI,
+    user_prompt: str,
+    debug: bool = False,
+    model_name: str = MODEL_NAME,
+    extra_body: dict | None = None,
+) -> dict:
     """Call LM Studio with structured output — response is guaranteed to match RESPONSE_SCHEMA."""
     response = client.chat.completions.create(
-        model=MODEL_NAME,
+        model=model_name,
         messages=[
             {"role": "system", "content": SYSTEM_PROMPT},
             {"role": "user",   "content": user_prompt},
         ],
         temperature=VERIFIER_TEMPERATURE,
         response_format=VERIFIER_RESPONSE_FORMAT,
-        extra_body=LLM_EXTRA_BODY,
+        extra_body=extra_body,
     )
 
     msg = response.choices[0].message
@@ -486,11 +494,15 @@ def build_prompt(row: dict, text_col: str) -> str:
     if meta is None:
         raise ValueError(f"Unknown perturbation type: {name!r}")
 
-    expect_label = (
-        "PRESERVED — the core factual meaning should be unchanged"
-        if meta["expect_preserved"]
-        else "INTENTIONALLY ALTERED — the meaning is expected to have shifted"
-    )
+    if meta["expect_preserved"] is True:
+        expect_label = "PRESERVED — the core factual meaning should be unchanged"
+    elif meta["expect_preserved"] is False:
+        expect_label = "INTENTIONALLY ALTERED — the meaning is expected to have shifted"
+    else:
+        expect_label = (
+            "NEUTRAL — meaning may be preserved or altered; only correct application "
+            "of the perturbation is required"
+        )
 
     original  = row.get("original_text") or row.get(text_col) or ""
     perturbed = row.get("perturbed_text", "")
@@ -508,7 +520,15 @@ def build_prompt(row: dict, text_col: str) -> str:
 
 # ── Per-row verification ──────────────────────────────────────────────────────
 
-def verify_row(row: dict, text_col: str, client: OpenAI, delay: float) -> dict:
+def verify_row(
+    row: dict,
+    text_col: str,
+    client: OpenAI,
+    delay: float,
+    model_name: str = MODEL_NAME,
+    extra_body: dict | None = None,
+    retries: int = 2,
+) -> dict:
     """Verify one row. Returns a result dict with the five verification columns."""
     result: dict = {
         "perturbation_applied": None,
@@ -531,37 +551,47 @@ def verify_row(row: dict, text_col: str, client: OpenAI, delay: float) -> dict:
         result["verified"]             = False
         return result
 
-    try:
-        user_prompt = build_prompt(row, text_col)
-        verdict     = call_lm_studio(client, user_prompt)
+    user_prompt = build_prompt(row, text_col)
+    for attempt in range(retries + 1):
+        try:
+            verdict = call_lm_studio(
+                client,
+                user_prompt,
+                model_name=model_name,
+                extra_body=extra_body,
+            )
 
-        for key in ("perturbation_applied", "meaning_preserved", "verified"):
-            if key not in verdict:
-                raise KeyError(f"Model response missing key: {key!r}")
+            for key in ("perturbation_applied", "meaning_preserved", "verified"):
+                if key not in verdict:
+                    raise KeyError(f"Model response missing key: {key!r}")
 
-        # Re-derive 'verified' from ground truth — don't trust the model's own flag
-        meta          = PERTURBATION_META[name]
-        expected_pres = meta["expect_preserved"]
-        applied       = bool(verdict["perturbation_applied"])
-        if expected_pres is None:
-            # Neutral perturbation (A4_stt_artifacts): only check it was applied,
-            # don't require a specific meaning_preserved outcome.
-            recomputed = applied
-        else:
-            recomputed = applied and (bool(verdict["meaning_preserved"]) == expected_pres)
-        verdict["verified"] = recomputed
+            # Re-derive 'verified' from ground truth — don't trust the model's own flag
+            meta          = PERTURBATION_META[name]
+            expected_pres = meta["expect_preserved"]
+            applied       = bool(verdict["perturbation_applied"])
+            if expected_pres is None:
+                # Neutral perturbation (A4_stt_artifacts): only check it was applied,
+                # don't require a specific meaning_preserved outcome.
+                recomputed = applied
+            else:
+                recomputed = applied and (bool(verdict["meaning_preserved"]) == expected_pres)
+            verdict["verified"] = recomputed
 
-        result.update(verdict)
+            result.update(verdict)
+            result["verify_error"] = ""
+            break
+        except json.JSONDecodeError as exc:
+            result["verify_error"] = f"JSON parse error: {exc}"
+        except KeyError as exc:
+            result["verify_error"] = f"Missing key: {exc}"
+        except Exception as exc:
+            result["verify_error"] = str(exc)
 
-        if delay > 0:
-            time.sleep(delay)
+        if attempt < retries:
+            time.sleep(min(2 ** attempt, 8))
 
-    except json.JSONDecodeError as exc:
-        result["verify_error"] = f"JSON parse error: {exc}"
-    except KeyError as exc:
-        result["verify_error"] = f"Missing key: {exc}"
-    except Exception as exc:
-        result["verify_error"] = str(exc)
+    if delay > 0:
+        time.sleep(delay)
 
     return result
 
@@ -593,10 +623,44 @@ def main() -> None:
         help=f"Seconds between LLM calls per worker (default {REQUEST_DELAY}).",
     )
     parser.add_argument(
+        "--retries", type=int, default=2,
+        help="Retries per failed LLM request (default 2).",
+    )
+    parser.add_argument(
+        "--progress-every", type=int, default=100,
+        help="Print progress every N completed rows (default 100).",
+    )
+    parser.add_argument(
         "--dry-run", action="store_true",
         help=f"Process first {DRY_RUN_ROWS} rows, print results, write nothing.",
     )
+    parser.add_argument(
+        "--model", default=MODEL_NAME,
+        help=(
+            "Verifier model id. For an independent audit, choose a checkpoint "
+            "different from the generator."
+        ),
+    )
+    parser.add_argument(
+        "--base-url", default=LM_STUDIO_BASE_URL,
+        help=f"OpenAI-compatible API base URL (default: {LM_STUDIO_BASE_URL}).",
+    )
+    parser.add_argument(
+        "--api-key", default=os.environ.get("VERIFIER_API_KEY", LM_STUDIO_API_KEY),
+        help="API key, or set VERIFIER_API_KEY (default is the local LM Studio key).",
+    )
+    parser.add_argument(
+        "--allow-same-model", action="store_true",
+        help="Allow the generator checkpoint to be reused as verifier.",
+    )
     args = parser.parse_args()
+
+    if args.model == MODEL_NAME and not args.allow_same_model:
+        sys.exit(
+            "Refusing to reuse the generator checkpoint as verifier. "
+            "Pass --model with an independent checkpoint, or explicitly use "
+            "--allow-same-model for replication only."
+        )
 
     if not args.input.exists():
         sys.exit(f"Input file not found: {args.input}")
@@ -609,6 +673,8 @@ def main() -> None:
     print(f"Input  : {args.input}")
     print(f"Output : {output}")
     print(f"Workers: {args.workers}")
+    print(f"Verifier model: {args.model}")
+    print(f"Verifier URL  : {args.base_url}")
     if args.limit:
         print(f"Limit  : {args.limit} rows")
     print()
@@ -617,12 +683,8 @@ def main() -> None:
     with open(args.input, newline="", encoding="utf-8-sig") as f:
         reader    = csv.DictReader(f)
         fieldnames = list(reader.fieldnames or [])
-        all_rows  = list(reader)
-
-    if args.dry_run:
-        all_rows = all_rows[:DRY_RUN_ROWS]
-    elif args.limit:
-        all_rows = all_rows[:args.limit]
+        read_limit = DRY_RUN_ROWS if args.dry_run else args.limit
+        all_rows = list(itertools.islice(reader, read_limit)) if read_limit else list(reader)
 
     # ── detect dataset ────────────────────────────────────────────────────────
     try:
@@ -636,7 +698,9 @@ def main() -> None:
         "perturbation_applied", "meaning_preserved",
         "verified", "verify_error",
     ]
-    out_fieldnames = fieldnames + verify_cols
+    # Re-verification may use a CSV that already contains the old verdicts.
+    # Replace those fields rather than emitting duplicate column names.
+    out_fieldnames = [name for name in fieldnames if name not in verify_cols] + verify_cols
 
     # ── resume: load already-done (id, perturbation_name) pairs ──────────────
     done_pairs: set[tuple[str, str]] = set()
@@ -675,7 +739,8 @@ def main() -> None:
             writer.writeheader()
 
     # ── processing loop ───────────────────────────────────────────────────────
-    client     = OpenAI(base_url=LM_STUDIO_BASE_URL, api_key=LM_STUDIO_API_KEY)
+    client     = OpenAI(base_url=args.base_url, api_key=args.api_key)
+    extra_body = LLM_EXTRA_BODY if args.model == MODEL_NAME else None
     write_lock = threading.Lock()
     processed  = 0
     n_pass     = 0
@@ -684,49 +749,71 @@ def main() -> None:
     total      = len(todo)
 
     def _task(row: dict) -> tuple[dict, dict]:
-        verdict = verify_row(row, text_col, client, args.delay)
+        verdict = verify_row(
+            row, text_col, client, args.delay, args.model, extra_body, args.retries
+        )
         return row, verdict
 
     try:
         with ThreadPoolExecutor(max_workers=args.workers) as executor:
-            future_to_row = {executor.submit(_task, row): row for row in todo}
-            for future in as_completed(future_to_row):
-                exc = future.exception()
-                if exc:
-                    row = future_to_row[future]
-                    print(f"  FATAL {row[id_col]}/{row['perturbation_name']}: {exc}")
-                    n_error += 1
-                    continue
+            # Keep only a small multiple of worker-count requests queued. Submitting
+            # hundreds of thousands of futures at once consumes several GB of RAM.
+            row_iter = iter(todo)
+            pending = {}
+            queue_size = max(args.workers * 4, 1)
+            for row in itertools.islice(row_iter, queue_size):
+                pending[executor.submit(_task, row)] = row
 
-                row, verdict = future.result()
-                out_row = {**row, **verdict}
+            while pending:
+                completed, _ = wait(pending, return_when=FIRST_COMPLETED)
+                for future in completed:
+                    row_for_future = pending.pop(future)
+                    exc = future.exception()
+                    if exc:
+                        row = row_for_future
+                        print(f"  FATAL {row[id_col]}/{row['perturbation_name']}: {exc}")
+                        n_error += 1
+                    else:
+                        row, verdict = future.result()
+                        out_row = {**row, **verdict}
 
-                if args.dry_run:
-                    status = "✓" if verdict.get("verified") else "✗"
-                    print(
-                        f"  {status} {row[id_col]} | {row['perturbation_name']}\n"
-                        f"    applied={verdict['perturbation_applied']} "
-                        f"preserved={verdict['meaning_preserved']} "
-                        f"verified={verdict['verified']}\n"
-                        + (f"\n    ERROR: {verdict['verify_error']}" if verdict["verify_error"] else "")
-                    )
-                else:
-                    with write_lock:
-                        writer.writerow(out_row)
-                        out_file.flush()
+                        if args.dry_run:
+                            status = "✓" if verdict.get("verified") else "✗"
+                            print(
+                                f"  {status} {row[id_col]} | {row['perturbation_name']}\n"
+                                f"    applied={verdict['perturbation_applied']} "
+                                f"preserved={verdict['meaning_preserved']} "
+                                f"verified={verdict['verified']}\n"
+                                + (f"\n    ERROR: {verdict['verify_error']}" if verdict["verify_error"] else "")
+                            )
+                        else:
+                            with write_lock:
+                                writer.writerow(out_row)
+                                out_file.flush()
 
-                processed += 1
-                if verdict.get("verify_error"):
-                    n_error += 1
-                elif verdict.get("verified"):
-                    n_pass += 1
-                else:
-                    n_fail += 1
+                        if verdict.get("verify_error"):
+                            n_error += 1
+                        elif verdict.get("verified"):
+                            n_pass += 1
+                        else:
+                            n_fail += 1
 
-                pct = 100 * processed // total
-                print(f"  [{processed:6d}/{total}] {pct:3d}%  "
-                      f"id={row[id_col]}  {row['perturbation_name']}  "
-                      f"{'✓' if verdict.get('verified') else '✗'}")
+                    processed += 1
+                    if (
+                        args.dry_run
+                        or processed == total
+                        or processed % max(args.progress_every, 1) == 0
+                    ):
+                        pct = 100 * processed // total
+                        print(f"  [{processed:6d}/{total}] {pct:3d}%  "
+                              f"pass={n_pass:,} fail={n_fail:,} error={n_error:,}", flush=True)
+
+                    try:
+                        next_row = next(row_iter)
+                    except StopIteration:
+                        pass
+                    else:
+                        pending[executor.submit(_task, next_row)] = next_row
 
     finally:
         if out_file:

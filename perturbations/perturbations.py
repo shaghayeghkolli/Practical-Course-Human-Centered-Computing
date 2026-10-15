@@ -1,4 +1,5 @@
 import json
+import os
 import random
 from pathlib import Path
 
@@ -8,9 +9,11 @@ from pathlib import Path
 PROMPTS = json.loads((Path(__file__).parent / "perturbation_prompts.json").read_text())
 SYSTEM  = PROMPTS["system_prompt"]
 
-LM_STUDIO_BASE_URL = "http://localhost:8000/v1"
-LM_STUDIO_API_KEY  = "lm-studio"
-MODEL_NAME         = "unsloth/Qwen3.6-35B-A3B-NVFP4"
+LM_STUDIO_BASE_URL = os.environ.get("PERTURBATOR_BASE_URL", "http://localhost:8000/v1")
+LM_STUDIO_API_KEY  = os.environ.get("PERTURBATOR_API_KEY", "lm-studio")
+MODEL_NAME         = os.environ.get(
+    "PERTURBATOR_MODEL", "unsloth/Qwen3.6-35B-A3B-NVFP4"
+)
 
 # enableThinking=false (Qwen3.5)
 LLM_EXTRA_BODY = {

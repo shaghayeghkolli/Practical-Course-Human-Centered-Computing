@@ -1,71 +1,56 @@
-# ── Claude / Cowork ────────────────────────────────────────────────────────────
+# Local agent and editor state
+.agents/
+.codex/
 .claude/
 .auto-memory/
 .remote-plugins/
-
-# ── Python ─────────────────────────────────────────────────────────────────────
-__pycache__/
-*.py[cod]
-*.pyo
-*.pyd
-.Python
-*.egg
-*.egg-info/
-dist/
-build/
-eggs/
-.eggs/
-wheels/
-*.whl
-pip-wheel-metadata/
-
-# ── Virtual environments ────────────────────────────────────────────────────────
-.venv/
-venv/
-env/
-ENV/
-lib/
-lib64/
-bin/
-include/
-share/
-pyvenv.cfg
-
-# ── Jupyter ─────────────────────────────────────────────────────────────────────
-.ipynb_checkpoints/
-*.ipynb_checkpoints
-
-# ── Data — large files / raw datasets ───────────────────────────────────────────
-data
-
-# ── Model outputs / checkpoints ─────────────────────────────────────────────────
-*.ckpt
-*.pt
-*.bin
-*.safetensors
-checkpoints/
-
-# ── Environment / secrets ────────────────────────────────────────────────────────
-.env
-.env.*
-*.env
-secrets.json
-
-# ── OS ───────────────────────────────────────────────────────────────────────────
-.DS_Store
-.DS_Store?
-._*
-Thumbs.db
-desktop.ini
-
-# ── Editors ─────────────────────────────────────────────────────────────────────
 .idea/
 .vscode/
 *.swp
 *.swo
 *~
 
-# ── Logs / tmp ───────────────────────────────────────────────────────────────────
+# Python
+__pycache__/
+*.py[cod]
+*.pyd
+.Python
+*.egg-info/
+.pytest_cache/
+.coverage
+htmlcov/
+build/
+dist/
+
+# Environments and credentials
+.venv/
+venv/
+env/
+ENV/
+.env
+.env.*
+*.env
+secrets.json
+
+# Private or generated research data. Keep only the layout guide.
+data/*
+!data/README.md
+results/
+analysis_outputs/
+ensemble_verification/
+paper_results_four_model/
+.embedding_cache/
+checkpoints/
+*.ckpt
+*.pt
+*.bin
+*.safetensors
+
+# Generated logs, temporary files, and OS metadata
 *.log
 *.tmp
 *.temp
+.DS_Store
+._*
+Thumbs.db
+desktop.ini

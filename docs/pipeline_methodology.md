@@ -329,9 +329,13 @@ Introduces multiple typos, phonetic spelling, and text-speak abbreviations throu
 All LLM-based perturbations call a locally hosted model via LM Studio's OpenAI-compatible API.
 
 - **Model:** Qwen3.6-35B-A3B (unsloth NVFP4 quantization, `unsloth/Qwen3.6-35B-A3B-NVFP4`)
-- **Endpoint:** `http://localhost:8000/v1`
+- **Endpoint:** `http://localhost:8000/v1` by default
 - **Timeout:** 60 seconds per call
 - **Response format:** JSON with a single key `perturbed_text`
+
+The endpoint, placeholder API key, and model identifier can be overridden with
+`PERTURBATOR_BASE_URL`, `PERTURBATOR_API_KEY`, and `PERTURBATOR_MODEL`. Keep
+real credentials in the environment rather than source files.
 
 ### System Prompt
 
